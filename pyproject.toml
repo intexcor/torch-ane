@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "torch-ane"
+version = "0.1.0"
+description = "Run PyTorch models on the Apple Neural Engine via Core AI: compile any nn.Module, LLMs with KV cache, Stable Diffusion"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Ivan Shivalov" }]
+requires-python = ">=3.11"
+dependencies = ["torch>=2.10", "numpy", "coreai-torch>=0.4.3", "coreai-opt>=0.3"]
+keywords = ["pytorch", "apple-silicon", "neural-engine", "ane", "core-ai", "coreml", "llm", "stable-diffusion"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.optional-dependencies]
+llm = ["transformers>=5", "gguf"]
+diffusion = ["diffusers>=0.40", "transformers>=5"]
+dev = ["pytest", "pyflakes"]
+
+[project.urls]
+Repository = "https://github.com/intexcor/torch-ane"
+Issues = "https://github.com/intexcor/torch-ane/issues"
+
+[tool.setuptools.packages.find]
+include = ["torch_ane*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
