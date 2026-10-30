@@ -1,26 +1,26 @@
-"""Сжатие весов под ANE (палитры, int8) и масштаб против субнормальных fp16."""
+"""Weight compression for ANE (palettes, int8) and scale against subnormal fp16."""
 import torch
 
 
 def palettize_lut(model, n_bits=4, group_size=8, skip=("lm_head",), example_inputs=None, per_channel_scale=False,
                   bits_by_name=None, num_workers=1):
-    """Сжатие весов таблицей значений по рецепту Apple (coreai-models, пресет
-    4bit_weight_palettized_group{8,32}): на уровне torch до экспорта, k-means по группам
-    выходных каналов, эмбеддинги и lm_head не трогаются. В графе остаётся
-    coreai.lut_to_dense — его разжимает компилятор Core AI."""
+    """Weight compression with a lookup table per Apple's recipe (coreai-models, preset
+    4bit_weight_palettized_group{8,32}): at the torch level before export, k-means over groups
+    of output channels, embeddings and lm_head are left untouched. The graph keeps
+    coreai.lut_to_dense — the Core AI compiler decompresses it."""
     from coreai_opt import ExportBackend
     from coreai_opt.palettization import KMeansPalettizer, KMeansPalettizerConfig
     def spec(bits):
         sp = {"n_bits": bits, "granularity": {"type": "per_grouped_channel", "axis": 0, "group_size": group_size}}
-        if per_channel_scale:  # строки нормируются своим масштабом перед кластеризацией
+        if per_channel_scale:  # rows are normalized by their own scale before clustering
             sp["enable_per_channel_scale"] = True
         return {"op_state_spec": {"weight": sp}}
     names = {n: None for n in skip}
-    # bits_by_name: {подстрока имени модуля: биты} — например 6 бит там, где в GGUF был Q6_K
+    # bits_by_name: {module name substring: bits} — e.g. 6 bits where GGUF had Q6_K
     for name, mod in model.named_modules():
         if isinstance(mod, (torch.nn.Conv2d, torch.nn.Linear)) and bits_by_name:
             for pat, b in bits_by_name.items():
-                if pat in name:  # b=None — модуль не сжимать палитрой (например, позже int8)
+                if pat in name:  # b=None — don't palettize the module (e.g. int8 later)
                     names[name] = None if b is None else spec(b)
     cfg = KMeansPalettizerConfig.from_dict({"kmeans_palettization_config": {
         "global_config": spec(n_bits),
@@ -29,8 +29,8 @@ def palettize_lut(model, n_bits=4, group_size=8, skip=("lm_head",), example_inpu
     p = KMeansPalettizer(model, cfg)
     ex = example_inputs if example_inputs is not None else (torch.zeros(1, 8, dtype=torch.long),)
     out = p.finalize(p.prepare(example_inputs=ex, num_workers=num_workers), backend=ExportBackend.CoreAI)
-    # таблицы/индексы, посчитанные из весов с requires_grad, остаются узлами autograd —
-    # такие тензоры не копируются (deepcopy при экспорте); веса нам нужны только константами
+    # tables/indices computed from weights with requires_grad remain autograd nodes —
+    # such tensors aren't copied (deepcopy during export); we only need the weights as constants
     for mod in out.modules():
         for name, b in list(mod._buffers.items()):
             if b is not None and (b.requires_grad or b.grad_fn is not None):
@@ -41,7 +41,7 @@ def palettize_lut(model, n_bits=4, group_size=8, skip=("lm_head",), example_inpu
 
 
 class _ScaleOut(torch.nn.Module):
-    """Выход вложенной проекции, умноженный на s (масштаб — степень двойки, точно)."""
+    """Output of the wrapped projection multiplied by s (the scale is a power of two, exact)."""
 
     def __init__(self, inner, s):
         super().__init__()
@@ -52,19 +52,19 @@ class _ScaleOut(torch.nn.Module):
 
 
 def rescale_for_fp16(model, k=8, k_for=None):
-    """ANE сбрасывает в ноль крошечные (субнормальные) значения fp16, а у части моделей
-    (Devstral/Mistral) промежуточные активации MLP и V/внимания как раз такие: слой на
-    ANE ошибался на 2% выхода при 0.04% у fp16 в torch. Точная поправка без смены
-    математики: веса up_proj и v_proj умножаются на 2^k (MLP линеен по up, внимание —
-    по V), выход down_proj и o_proj — на 2^-k (веса down/o не трогаем: их деление
-    само загнало бы их в субнормальные). Для Llama-подобных слоёв."""
+    """ANE flushes tiny (subnormal) fp16 values to zero, and in some models
+    (Devstral/Mistral) the intermediate MLP and V/attention activations are exactly that: a layer on
+    ANE was off by 2% of the output vs 0.04% for fp16 in torch. An exact fix without changing
+    the math: up_proj and v_proj weights are multiplied by 2^k (the MLP is linear in up, attention —
+    in V), the down_proj and o_proj output by 2^-k (down/o weights are left alone: dividing them
+    would itself push them into subnormals). For Llama-like layers."""
     count = 0
     for mod in list(model.modules()):
         for up_name, down_name, owner in (("up_proj", "down_proj", "mlp"), ("v_proj", "o_proj", "self_attn")):
             up, down = getattr(mod, up_name, None), getattr(mod, down_name, None)
             if not (isinstance(up, torch.nn.Linear) and isinstance(down, torch.nn.Linear)):
                 continue
-            if down.bias is not None:  # смещение на выходе масштаб бы испортил
+            if down.bias is not None:  # a bias on the output would break the scale
                 continue
             kk = k if k_for is None else k_for(down)
             if not kk:
@@ -80,9 +80,9 @@ def rescale_for_fp16(model, k=8, k_for=None):
 
 
 def _kmeans1d_groups(x, k, iters=20):
-    """Одномерный k-means для каждой строки x [G, N] -> (центры [G, k], индексы [G, N]).
-    Старт с квантилей; присваивание — searchsorted по серединам между отсортированными
-    центрами (O(N log k)), пересчёт — scatter_add."""
+    """1D k-means for each row of x [G, N] -> (centers [G, k], indices [G, N]).
+    Initialized from quantiles; assignment — searchsorted over midpoints between sorted
+    centers (O(N log k)), update — scatter_add."""
     G, N = x.shape
     qs = torch.linspace(0.5 / k, 1 - 0.5 / k, k, device=x.device, dtype=x.dtype)
     sample = x if N <= 16384 else x[:, torch.randint(0, N, (16384,), device=x.device)]
@@ -90,21 +90,21 @@ def _kmeans1d_groups(x, k, iters=20):
     for _ in range(iters):
         c, _ = c.sort(dim=1)
         mid = (c[:, 1:] + c[:, :-1]) / 2
-        idx = torch.searchsorted(mid, x)  # [G, N] в [0, k)
+        idx = torch.searchsorted(mid, x)  # [G, N] in [0, k)
         s = torch.zeros(G, k, device=x.device, dtype=x.dtype).scatter_add_(1, idx, x)
         n = torch.zeros(G, k, device=x.device, dtype=x.dtype).scatter_add_(1, idx, torch.ones_like(x))
-        c = torch.where(n > 0, s / n.clamp(min=1), c)  # пустой кластер — остаётся на месте
+        c = torch.where(n > 0, s / n.clamp(min=1), c)  # an empty cluster stays in place
     c, _ = c.sort(dim=1)
     idx = torch.searchsorted((c[:, 1:] + c[:, :-1]) / 2, x)
     return c, idx
 
 
 def prequantize_lut(model, n_bits=4, group_size=8, skip=(), device=None, batch_values=1 << 26, iters=20):
-    """Быстрая замена медленной части сжатия палитрой: k-means для всех групп сразу на
-    GPU (MPS), веса заменяются своими центрами — в каждой группе из group_size выходных
-    каналов остаётся <= 2^n_bits значений. Потом обычный palettize_lut (публичное API
-    coreai-opt) на таких весах сходится сразу: на Devstral k-means coreai-opt шёл
-    ~40-90 с на слой одним ядром. skip — подстроки имён модулей, которые не трогать."""
+    """Fast replacement for the slow part of palettization: k-means for all groups at once on
+    GPU (MPS), weights are replaced by their centers — each group of group_size output
+    channels keeps <= 2^n_bits values. Then the regular palettize_lut (public coreai-opt
+    API) on such weights converges immediately: on Devstral the coreai-opt k-means took
+    ~40-90 s per layer on a single core. skip — module name substrings to leave untouched."""
     dev = device or ("mps" if torch.backends.mps.is_available() else "cpu")
     k, count = 2 ** n_bits, 0
     for name, mod in model.named_modules():
@@ -114,7 +114,7 @@ def prequantize_lut(model, n_bits=4, group_size=8, skip=(), device=None, batch_v
         O = w.shape[0]
         if O % group_size:
             continue
-        flat = w.reshape(O // group_size, -1)  # группа = group_size выходных каналов целиком
+        flat = w.reshape(O // group_size, -1)  # group = group_size whole output channels
         out = torch.empty_like(flat)
         step = max(1, batch_values // flat.shape[1])
         for g0 in range(0, flat.shape[0], step):
@@ -128,12 +128,12 @@ def prequantize_lut(model, n_bits=4, group_size=8, skip=(), device=None, batch_v
 
 
 def quantize_int8_modules(model, patterns, example_inputs):
-    """int8 по каналам (только веса, пресет w8 coreai-opt) для модулей, в имени которых
-    есть одна из подстрок patterns; остальное не трогается. После этого их веса — int8
-    константы с деквантованием, и сжатие таблицей готовой программы их не задевает.
-    patterns=None — все nn.Linear и nn.Conv2d (с осью 0 явно: у подклассов Linear,
-    как в Whisper, Quantizer её сам не выводит). Conv1d не квантуется: int8 в ней роняет
-    компилятор ANE, и вся функция молча уходит на GPU."""
+    """Per-channel int8 (weights only, coreai-opt w8 preset) for modules whose name
+    contains one of the patterns substrings; the rest is left untouched. After this their weights are int8
+    constants with dequantization, and the finished program's table compression doesn't touch them.
+    patterns=None — all nn.Linear and nn.Conv2d (with axis 0 explicitly: for Linear subclasses,
+    as in Whisper, Quantizer doesn't infer it itself). Conv1d is not quantized: int8 in it crashes
+    the ANE compiler, and the whole function silently falls back to GPU."""
     from coreai_opt import ExportBackend
     from coreai_opt.quantization import ModuleQuantizerConfig, Quantizer, QuantizerConfig
     from coreai_opt.quantization.config import ExecutionMode
@@ -153,7 +153,7 @@ def quantize_int8_modules(model, patterns, example_inputs):
                                          module_name_configs={n: cfg for n in names}))
     q.prepare(example_inputs)
     out = q.finalize(backend=ExportBackend.CoreAI)
-    for mod in out.modules():  # как в palettize_lut: веса — константы, без autograd
+    for mod in out.modules():  # as in palettize_lut: weights are constants, no autograd
         for k, b in list(mod._buffers.items()):
             if b is not None and (b.requires_grad or b.grad_fn is not None):
                 mod._buffers[k] = b.detach()
@@ -163,12 +163,12 @@ def quantize_int8_modules(model, patterns, example_inputs):
 
 
 def calibrate_rescale(model, run, inter_max=2048.0, out_max=8192.0, kmax=8):
-    """Масштаб 2^k для rescale_for_fp16 — свой у каждой пары проекций, по калибровке:
-    run() прогоняет модель во fp32 на настоящем тексте. Без этого общий 2^8 переполнял
-    fp16 в слоях с «массивными активациями» (у Devstral слой 2: silu(gate)*up до 282,
-    x256 = 72198 > 65504) — ANE обрезает до максимума, и выход куска превращался в мусор.
-    k = наибольшее <= kmax, при котором вход down_proj/o_proj (и выход v_proj) x2^k <= inter_max
-    и выход down_proj/o_proj x2^k <= out_max. Возвращает k_for(down_module) -> k."""
+    """Scale 2^k for rescale_for_fp16 — per projection pair, from calibration:
+    run() runs the model in fp32 on real text. Without it a shared 2^8 overflowed
+    fp16 in layers with "massive activations" (Devstral layer 2: silu(gate)*up up to 282,
+    x256 = 72198 > 65504) — ANE clamps to the maximum, and the chunk output turned into garbage.
+    k = the largest <= kmax for which the down_proj/o_proj input (and v_proj output) x2^k <= inter_max
+    and the down_proj/o_proj output x2^k <= out_max. Returns k_for(down_module) -> k."""
     import math
     stats, hooks = {}, []
 

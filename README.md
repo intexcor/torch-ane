@@ -120,7 +120,6 @@ UNet/VAE attention uses Apple's layout: BC1S, heads split, `einsum` with no tran
   `ChunkedCausalLM.keep_warm()` to avoid this.
 - Copying an input into Core AI runs at ~0.5 GB/s, about 10 ms per 4 MB input. The public API
   has no way around this.
-- Code comments are in Russian.
 
 ## Tests
 

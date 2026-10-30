@@ -1,28 +1,28 @@
-"""Раскладка по правилам Apple для ANE: свёртки 1x1 вместо Linear, внимание по головам,
-деление слишком широких проекций."""
+"""Layout per Apple's rules for ANE: 1x1 convs instead of Linear, per-head attention,
+splitting overly wide projections."""
 import torch
 
 
-# --- правила Apple для ANE (apple/coreai-models, neural_engine_rules.md) ----------
+# --- Apple's rules for ANE (apple/coreai-models, neural_engine_rules.md) ----------
 #
-#  * «Conv2d instead of Linear»: nn.Linear на ANE раскладывается на менее
-#    эффективные операции, свёртка 1x1 идёт прямо в свёрточный движок;
-#  * «Per-head attention»: на ANE нет слитого SDPA — головы считаются по
-#    отдельности, Q@K — einsum "bchq,bkhc->bkhq" (без транспонирований),
-#    softmax по оси каналов (ключи), маска в раскладке (1, K, 1, Q);
-#  * маска -40000, не -inf: ANE неверно считает softmax с -inf.
+#  * "Conv2d instead of Linear": nn.Linear on ANE is lowered into less
+#    efficient ops, a 1x1 conv goes straight into the conv engine;
+#  * "Per-head attention": ANE has no fused SDPA — heads are computed
+#    separately, Q@K — einsum "bchq,bkhc->bkhq" (no transposes),
+#    softmax along the channel axis (keys), mask in layout (1, K, 1, Q);
+#  * mask -40000, not -inf: ANE computes softmax with -inf incorrectly.
 
 MASK_NEG = -40000.0
 
 
 class ConvLinear(torch.nn.Module):
-    """nn.Linear как свёртка 1x1. layout="bc1s": токены по ширине — (1, I, 1, N),
-    как требует раскладка ANE (B, C, 1, S); "n111": токены по батчу — (N, I, 1, 1),
-    как в MLP из примеров Apple."""
+    """nn.Linear as a 1x1 conv. layout="bc1s": tokens along the width — (1, I, 1, N),
+    as the ANE layout (B, C, 1, S) requires; "n111": tokens along the batch — (N, I, 1, 1),
+    as in the MLP from Apple's examples."""
 
     def __init__(self, lin, layout="bc1s"):
         super().__init__()
-        # настоящий nn.Conv2d: его узнаёт сжатие coreai-opt (палитры на ANE — для свёрток)
+        # a real nn.Conv2d: coreai-opt compression recognizes it (palettes on ANE are for convs)
         self.conv = torch.nn.Conv2d(lin.in_features, lin.out_features, 1, bias=lin.bias is not None)
         with torch.no_grad():
             self.conv.weight.copy_(lin.weight[:, :, None, None])
@@ -43,8 +43,8 @@ class ConvLinear(torch.nn.Module):
 
 
 def swap_linear(model, layout="bc1s", skip=("lm_head",)):
-    """Все nn.Linear -> ConvLinear (кроме lm_head и огромных выходов: свёртка с
-    O=150k каналов на ANE не выигрывает и раздувает компиляцию)."""
+    """All nn.Linear -> ConvLinear (except lm_head and huge outputs: a conv with
+    O=150k channels gains nothing on ANE and bloats compilation)."""
     count = 0
     for name, mod in list(model.named_modules()):
         for cname, child in list(mod.named_children()):
@@ -57,8 +57,8 @@ def swap_linear(model, layout="bc1s", skip=("lm_head",)):
 
 
 def _ane_mask(mask, B, H, Q, K, causal):
-    """Маска transformers (bool «видно» или аддитивная, (B|1, 1|H, Q, K)) или None ->
-    аддитивная fp-маска (B, K, 1, Q) с -40000."""
+    """A transformers mask (bool "visible" or additive, (B|1, 1|H, Q, K)) or None ->
+    an additive fp mask (B, K, 1, Q) with -40000."""
     if mask is None:
         if not causal or Q == 1:
             return None
@@ -72,7 +72,7 @@ def _ane_mask(mask, B, H, Q, K, causal):
 
 
 def ane_attention(module, query, key, value, attention_mask, dropout=0.0, scaling=None, is_causal=None, **kwargs):
-    """Внимание для transformers в стиле Apple: по головам, einsum в раскладке ANE.
+    """Apple-style attention for transformers: per head, einsum in the ANE layout.
     query (B, H, Q, D), key/value (B, Hkv, K, D) -> ((B, Q, H, D), None)."""
     B, H, Q, D = query.shape
     Hkv, K = key.shape[1], key.shape[2]
@@ -80,8 +80,8 @@ def ane_attention(module, query, key, value, attention_mask, dropout=0.0, scalin
     scale = D ** -0.5 if scaling is None else scaling
     causal = getattr(module, "is_causal", True) if is_causal is None else is_causal
     mask = _ane_mask(attention_mask, B, H, Q, K, causal)
-    # масштаб — на Q до умножения: у Qwen2.5 и др. Q·K без масштаба выходит за fp16
-    q = (query * scale).permute(0, 1, 3, 2)[:, :, :, None, :]   # (B, H, D, 1, Q): голова -> bchq
+    # scale is applied to Q before the matmul: in Qwen2.5 etc. unscaled Q·K overflows fp16
+    q = (query * scale).permute(0, 1, 3, 2)[:, :, :, None, :]   # (B, H, D, 1, Q): head -> bchq
     k = key[:, :, :, None, :]                          # (B, Hkv, K, 1, D): bkhc
     v = value[:, :, :, None, :]
     outs = []
@@ -101,8 +101,8 @@ _REGISTERED = False
 
 
 def _register_attention():
-    """attn_implementation="ane" для моделей transformers (маска — как у sdpa, но
-    всегда тензором, без пропуска «is_causal»)."""
+    """attn_implementation="ane" for transformers models (the mask is as for sdpa, but
+    always a tensor, without the "is_causal" skip)."""
     global _REGISTERED
     if _REGISTERED:
         return
@@ -119,7 +119,7 @@ def _register_attention():
 
 
 def use_ane_attention(model):
-    """Переключить все конфиги transformers внутри модели на внимание "ane"."""
+    """Switch all transformers configs inside the model to "ane" attention."""
     try:
         _register_attention()
     except ImportError:
@@ -136,8 +136,8 @@ def use_ane_attention(model):
 
 
 class SplitConvLinear(torch.nn.Module):
-    """ConvLinear шире предела ANE на измерение — несколько свёрток по limit каналов:
-    по выходу (конкатенация) или по входу (сумма). Та же математика."""
+    """A ConvLinear wider than the ANE per-dimension limit — several convs of limit channels each:
+    along the output (concatenation) or along the input (sum). The same math."""
 
     def __init__(self, cl, limit=16384):
         super().__init__()
@@ -168,7 +168,7 @@ class SplitConvLinear(torch.nn.Module):
 
 
 def split_wide(model, limit=16384):
-    """ConvLinear с измерением больше limit -> SplitConvLinear (предел ANE ~16384)."""
+    """ConvLinear with a dimension larger than limit -> SplitConvLinear (ANE limit ~16384)."""
     count = 0
     for mod in list(model.modules()):
         for name, child in list(mod.named_children()):
@@ -179,23 +179,23 @@ def split_wide(model, limit=16384):
     return count
 
 
-# --- деление MLP по скрытому измерению под внутреннюю память ANE -----------------
+# --- splitting the MLP along the hidden dimension to fit ANE on-chip memory --------
 #
-# Вес Linear больше нескольких МБ вместе с промежуточной активацией [S, hidden] не
-# помещается во внутреннюю память ANE (~32 МБ на M4, по maderix/ANE), и ANE на любом
-# числе позиций упирается в шину (~50 ГБ/с). MLP Whisper large 1280 -> 5120 -> 1280 на
-# 1500 позициях: 6.6 TFLOP/s; скрытое измерение кусками по 3.3 МБ веса, каждый кусок
-# up сразу в свой кусок down, сумма — 9.5.
-# Резать каждую Linear отдельно (конкатенация после up) не помогает: активация
-# [S, hidden] всё равно собирается целиком.
+# A Linear weight larger than a few MB together with the intermediate activation [S, hidden] doesn't
+# fit into ANE on-chip memory (~32 MB on M4, per maderix/ANE), and ANE at any
+# number of positions is bound by the bus (~50 GB/s). Whisper large MLP 1280 -> 5120 -> 1280 at
+# 1500 positions: 6.6 TFLOP/s; hidden dimension in chunks of 3.3 MB of weight, each up chunk
+# straight into its own down chunk, summed — 9.5.
+# Splitting each Linear separately (concatenation after up) doesn't help: the activation
+# [S, hidden] is still assembled in full.
 
 class ChunkedMLP(torch.nn.Module):
-    """MLP с кусками скрытого измерения: y = sum_i down_i(act(up_i(x)) [* gate-часть]).
-    Та же математика, сумма частичных результатов в порядке кусков."""
+    """MLP with chunks of the hidden dimension: y = sum_i down_i(act(up_i(x)) [* gate part]).
+    The same math, partial results summed in chunk order."""
 
     def __init__(self, up, down, act, gate=None, k=4, scale=1.0):
         super().__init__()
-        self.scale = float(scale)  # множитель после суммы (_ScaleOut из rescale_for_fp16)
+        self.scale = float(scale)  # multiplier after the sum (_ScaleOut from rescale_for_fp16)
         hidden = up.out_features
         step = hidden // k
 
@@ -225,7 +225,7 @@ class ChunkedMLP(torch.nn.Module):
 
 
 def _mlp_chunks(hidden, in_features, max_bytes):
-    """Число кусков: вес куска up (fp16) не больше max_bytes, кусок кратен 64."""
+    """Number of chunks: the up chunk weight (fp16) is at most max_bytes, the chunk is a multiple of 64."""
     for k in range(1, hidden // 64 + 1):
         if hidden % k == 0 and (hidden // k) % 64 == 0 and hidden // k * in_features * 2 <= max_bytes:
             return k
@@ -233,7 +233,7 @@ def _mlp_chunks(hidden, in_features, max_bytes):
 
 
 def _halves(proj):
-    """Linear с выходом [hidden | gate] (GEGLU diffusers) -> две Linear по половинам."""
+    """A Linear with output [hidden | gate] (diffusers GEGLU) -> two Linears over the halves."""
     n = proj.out_features // 2
     out = []
     for i in range(2):
@@ -248,7 +248,7 @@ def _halves(proj):
 
 
 class _Gelu(torch.nn.Module):
-    """Активация GEGLU/GELU diffusers: F.gelu с их approximate."""
+    """diffusers GEGLU/GELU activation: F.gelu with their approximate."""
 
     def __init__(self, approximate="none"):
         super().__init__()
@@ -259,7 +259,7 @@ class _Gelu(torch.nn.Module):
 
 
 def _find_mlp(child):
-    """(up, act, down, gate) для узнаваемого MLP или None."""
+    """(up, act, down, gate) for a recognizable MLP, or None."""
     L = torch.nn.Linear
     if (isinstance(child, torch.nn.Sequential) and len(child) == 3 and isinstance(child[0], L)
             and isinstance(child[2], L) and not isinstance(child[1], L)
@@ -270,7 +270,7 @@ def _find_mlp(child):
     if hasattr(child, "activation_fn") and isinstance(getattr(child, "fc1", None), L) \
             and isinstance(getattr(child, "fc2", None), L):  # CLIP
         return child.fc1, child.activation_fn, child.fc2, None
-    net = getattr(child, "net", None)  # FeedForward diffusers: [GEGLU | GELU, Dropout, Linear, (Dropout)]
+    net = getattr(child, "net", None)  # diffusers FeedForward: [GEGLU | GELU, Dropout, Linear, (Dropout)]
     if isinstance(net, torch.nn.ModuleList) and isinstance(getattr(net[0], "proj", None), L):
         lins = [m for m in net if isinstance(m, L)]
         if len(lins) != 1 or any(not isinstance(m, (L, torch.nn.Dropout)) for m in list(net)[1:]):
@@ -285,11 +285,11 @@ def _find_mlp(child):
 
 
 def chunk_mlp(model, max_bytes=4 << 20):
-    """MLP с весом проекции больше max_bytes -> ChunkedMLP. Узнаёт nn.Sequential
-    (Linear, активация, Linear) (Whisper, ViT), gate_proj/up_proj/down_proj + act_fn
-    (LLaMA/Qwen), fc1/fc2 + activation_fn (CLIP) и FeedForward diffusers с GEGLU/GELU
-    (UNet); down_proj в обёртке масштаба (rescale_for_fp16) разворачивается. Возвращает
-    число замен."""
+    """MLP with a projection weight larger than max_bytes -> ChunkedMLP. Recognizes nn.Sequential
+    (Linear, activation, Linear) (Whisper, ViT), gate_proj/up_proj/down_proj + act_fn
+    (LLaMA/Qwen), fc1/fc2 + activation_fn (CLIP) and diffusers FeedForward with GEGLU/GELU
+    (UNet); a down_proj in a scale wrapper (rescale_for_fp16) is unwrapped. Returns
+    the number of replacements."""
     count = 0
     for mod in list(model.modules()):
         for name, child in list(mod.named_children()):
@@ -298,7 +298,7 @@ def chunk_mlp(model, max_bytes=4 << 20):
                 continue
             up, act, down, gate = found
             scale = 1.0
-            if not isinstance(down, torch.nn.Linear):  # _ScaleOut: inner Linear и множитель s
+            if not isinstance(down, torch.nn.Linear):  # _ScaleOut: inner Linear and multiplier s
                 if not isinstance(getattr(down, "inner", None), torch.nn.Linear):
                     continue
                 down, scale = down.inner, down.s

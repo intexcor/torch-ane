@@ -1,4 +1,4 @@
-"""torch_ane: компиляция на Neural Engine, проходы, LLM с KV-кешем-состоянием."""
+"""torch_ane: compilation for the Neural Engine, passes, LLM with the KV cache as state."""
 import subprocess
 import sys
 
@@ -8,11 +8,11 @@ import torch.nn as nn
 
 import torch_ane
 
-needs_coreai = pytest.mark.skipif(not torch_ane.available(), reason="нет Core AI (macOS 27 + coreai-torch)")
+needs_coreai = pytest.mark.skipif(not torch_ane.available(), reason="no Core AI (macOS 27 + coreai-torch)")
 
 
 def test_no_mlx_dependency():
-    """Библиотека самостоятельна: импорт torch_ane и его LLM-части не тянет MLX и torch_mlx."""
+    """The library is standalone: importing torch_ane and its LLM part does not pull in MLX or torch_mlx."""
     code = ("import sys, torch_ane; torch_ane.CausalLM; torch_ane.passes.swap_linear; "
             "print(any(m == 'mlx' or m.startswith(('mlx.', 'torch_mlx')) for m in sys.modules))")
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout
@@ -20,8 +20,8 @@ def test_no_mlx_dependency():
 
 
 def test_prune_cache(tmp_path, monkeypatch):
-    """Кеш сборок не больше лимита: удаляются давно не использованные, keep и
-    недописанные (.partial) остаются."""
+    """The build cache stays under the limit: least recently used builds are removed, keep and
+    unfinished (.partial) ones stay."""
     import os
 
     from torch_ane import runtime
@@ -31,7 +31,7 @@ def test_prune_cache(tmp_path, monkeypatch):
         d.mkdir()
         (d / "w").write_bytes(b"x" * 1000)
         os.utime(d, (1000 + i, 1000 + i))
-    freed = runtime.prune_cache(max_gb=2.5e-6, keep=(tmp_path / "a.aimodel",))  # лимит 2500 байт
+    freed = runtime.prune_cache(max_gb=2.5e-6, keep=(tmp_path / "a.aimodel",))  # limit of 2500 bytes
     assert freed == 2000 and sorted(p.name for p in tmp_path.iterdir()) == ["a.aimodel", "d.partial.aimodel"]
 
 
@@ -58,8 +58,8 @@ def test_compile_matches_eager():
 
 @needs_coreai
 def test_compile_int8_with_conv1d():
-    """compress="int8" на ANE: int8 только в Linear/Conv2d. Сжатие готовой программы
-    квантовало и Conv1d — компилятор ANE падал, модель уходила на GPU с мусором на выходе."""
+    """compress="int8" on ANE: int8 only in Linear/Conv2d. Compressing the finished program also
+    quantized Conv1d: the ANE compiler failed and the model fell back to GPU with garbage output."""
     class Net(nn.Module):
         def __init__(self):
             super().__init__()
@@ -78,14 +78,14 @@ def test_compile_int8_with_conv1d():
         ref = m(x)
     out = cm(x)
     if cm.ane_stats:
-        assert cm.ane_stats["int8"] == 2  # две Linear, Conv1d не тронута
+        assert cm.ane_stats["int8"] == 2  # two Linear, Conv1d untouched
     assert ((out - ref).norm() / ref.norm()) < 3e-2
 
 
 @needs_coreai
 def test_ane_passes_llm():
-    """ANE-проходы на LLM из transformers без правок под модель: RMSNorm -> составная операция,
-    свёртка констант (маска, RoPE), причинная маска -> is_causal; следующий токен как у eager."""
+    """ANE passes on an LLM from transformers with no model-specific edits: RMSNorm -> composite op,
+    constant folding (mask, RoPE), causal mask -> is_causal; the next token matches eager."""
     from transformers import Qwen2Config, Qwen2ForCausalLM
 
     class Prefill(nn.Module):
@@ -105,7 +105,7 @@ def test_ane_passes_llm():
     out = m(ids)
     with torch.no_grad():
         ref = model(ids)
-    if m.ane_stats:  # при загрузке из дискового кеша проходы не запускаются
+    if m.ane_stats:  # passes do not run when loading from the disk cache
         assert {k: m.ane_stats[k] for k in ("rms_norm", "causal")} == {"rms_norm": 5, "causal": 2}
         assert m.ane_stats["folded"] > 0
     assert int(out.argmax()) == int(ref.argmax())
@@ -113,8 +113,8 @@ def test_ane_passes_llm():
 
 
 def test_ane_rules_eager_equivalent():
-    """Правила Apple для ANE (Linear -> свёртка 1x1, внимание по головам) не меняют
-    математику модели: проверка в eager, без Core AI."""
+    """Apple's ANE rules (Linear -> 1x1 conv, per-head attention) do not change the model's
+    math: checked in eager, without Core AI."""
     from transformers import Qwen2Config, Qwen2ForCausalLM
 
     from torch_ane import passes
@@ -131,8 +131,8 @@ def test_ane_rules_eager_equivalent():
 
 
 def test_chunk_mlp_eager_equivalent():
-    """MLP кусками скрытого измерения: Sequential (Whisper) и gate/up/down (Qwen) — та же
-    математика; маленькие MLP не трогаются."""
+    """MLP in chunks of the hidden dimension: Sequential (Whisper) and gate/up/down (Qwen) keep the
+    same math; small MLPs are left alone."""
     from transformers import Qwen2Config, Qwen2ForCausalLM
 
     from torch_ane import passes
@@ -144,13 +144,13 @@ def test_chunk_mlp_eager_equivalent():
     with torch.no_grad():
         ref_s, ref_l = seq(x), lm(ids).logits
         m, st = passes.prepare(seq, ("mlp_chunk",))
-        assert st["mlp_chunk"] == 0  # вес 0.5 МБ — меньше порога
+        assert st["mlp_chunk"] == 0  # 0.5 MB weight is below the threshold
         assert passes.chunk_mlp(m, max_bytes=128 << 10) == 1 and len(m[0].up) == 4
         torch.testing.assert_close(m(x), ref_s, rtol=1e-4, atol=1e-5)
         m, _ = passes.prepare(lm, ())
         assert passes.chunk_mlp(m, max_bytes=8 << 10) == 2 and len(m.model.layers[0].mlp.up) == 4
         torch.testing.assert_close(m(ids).logits, ref_l, rtol=1e-4, atol=1e-4)
-        m, _ = passes.prepare(lm, ())  # down_proj в обёртке масштаба (CausalLM)
+        m, _ = passes.prepare(lm, ())  # down_proj inside the scale wrapper (CausalLM)
         passes.rescale_for_fp16(m, k=4)
         assert passes.chunk_mlp(m, max_bytes=8 << 10) == 2 and m.model.layers[0].mlp.scale == 2 ** -4
         torch.testing.assert_close(m(ids).logits, ref_l, rtol=1e-4, atol=1e-4)
@@ -158,8 +158,8 @@ def test_chunk_mlp_eager_equivalent():
 
 @needs_coreai
 def test_causal_lm_matches_eager():
-    """KV-кеш — состояния Core AI (схема Apple): prefill куском + декод окнами по 8
-    дают те же логиты, что transformers на всём контексте."""
+    """KV cache as Core AI state (Apple's scheme): chunked prefill + decode in windows of 8
+    give the same logits as transformers on the full context."""
     from transformers import Qwen2Config, Qwen2ForCausalLM
 
     import numpy as np
@@ -167,7 +167,7 @@ def test_causal_lm_matches_eager():
     torch.manual_seed(0)
     lm = Qwen2ForCausalLM(Qwen2Config(hidden_size=128, intermediate_size=256, num_hidden_layers=2,
                                       num_attention_heads=4, num_key_value_heads=2, vocab_size=1000)).eval()
-    ids = torch.randint(0, 1000, (100,)).tolist()  # 37 + 63: переход со ступени 64 на 128
+    ids = torch.randint(0, 1000, (100,)).tolist()  # 37 + 63: crosses from the 64 rung to 128
     st = torch_ane.CausalLM(lm, max_len=256, prefill_q=32, ladder=(64, 128))
     st.reset()
     st._hist = []
@@ -181,22 +181,22 @@ def test_causal_lm_matches_eager():
 
 @needs_coreai
 def test_causal_lm_batch_matches_single():
-    """Потоки в окне декода (generate_batch): у каждого свои позиции и маска, K/V вперемешку
-    в общем буфере — токены совпадают с одиночной генерацией каждого промпта."""
+    """Streams in the decode window (generate_batch): each has its own positions and mask, K/V
+    interleaved in a shared buffer; tokens match generating each prompt alone."""
     from transformers import Qwen2Config, Qwen2ForCausalLM
 
     torch.manual_seed(0)
     lm = Qwen2ForCausalLM(Qwen2Config(hidden_size=128, intermediate_size=256, num_hidden_layers=2,
                                       num_attention_heads=4, num_key_value_heads=2, vocab_size=1000)).eval()
-    prompts = [torch.randint(0, 1000, (n,)).tolist() for n in (5, 40, 17)]  # 40 — два куска prefill
+    prompts = [torch.randint(0, 1000, (n,)).tolist() for n in (5, 40, 17)]  # 40 = two prefill chunks
     st = torch_ane.CausalLM(lm, max_len=256, prefill_q=32, ladder=(128,), batch=True)
     assert st.generate_batch(prompts, 12) == [st.generate(p, 12) for p in prompts]
 
 
 @needs_coreai
 def test_silu_after_groupnorm():
-    """Родная SiLU на ANE врёт около нуля (~5% после GroupNorm); export_for_ane заменяет её
-    записью через tanh — связка GroupNorm -> SiLU -> свёртка совпадает с eager."""
+    """Native SiLU on ANE is off near zero (~5% after GroupNorm); export_for_ane replaces it with a
+    tanh form, so GroupNorm -> SiLU -> conv matches eager."""
     torch.manual_seed(0)
     m = nn.Sequential(nn.GroupNorm(8, 64), nn.SiLU(), nn.Conv2d(64, 64, 3, padding=1)).eval()
     x = torch.randn(2, 64, 16, 16) * 3

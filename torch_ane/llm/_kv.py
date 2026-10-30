@@ -1,12 +1,12 @@
-"""Общее для LLM на ANE: KV-кеш — состояния Core AI (схема Apple: весь K одним
-состоянием, весь V другим, запись куска — coreai.slice_update со смещением из входа),
-слой кеша transformers поверх этих буферов и маска окна."""
+"""Shared pieces for LLMs on ANE: the KV cache as Core AI states (Apple's scheme: all of K
+in one state, all of V in another, a chunk is written with coreai.slice_update at an offset
+taken from an input), a transformers cache layer over these buffers, and the window mask."""
 import numpy as np
 import torch
 from transformers.cache_utils import CacheLayerMixin
 
 DECODE_Q = 8
-MASK_NEG = -40000.0  # не -inf: ANE неверно считает softmax с -inf
+MASK_NEG = -40000.0  # not -inf: ANE computes softmax with -inf incorrectly
 
 _lib = torch.library.Library("torch_ane", "FRAGMENT")
 _lib.define("kv_write(Tensor cache, Tensor new, int layer, Tensor step) -> Tensor")
@@ -14,7 +14,7 @@ _lib.define("kv_write(Tensor cache, Tensor new, int layer, Tensor step) -> Tenso
 
 @torch.library.impl(_lib, "kv_write", "CompositeExplicitAutograd")
 def _kv_write(cache, new, layer, step):
-    """cache [L, 1, kv, M, hd], new [1, 1, kv, C, hd] (ранг как у кеша — требование
+    """cache [L, 1, kv, M, hd], new [1, 1, kv, C, hd] (same rank as the cache, required by
     slice_update): cache[layer, :, :, step:step+C] = new."""
     out = cache.clone()
     s = int(step.reshape(-1)[0])
@@ -44,7 +44,7 @@ def register_lowering(conv):
 
 
 class StateLayer(CacheLayerMixin):
-    """Слой кеша transformers поверх общих буферов модуля-владельца."""
+    """transformers cache layer over the shared buffers of the owner module."""
 
     is_sliding = False
 
@@ -75,7 +75,7 @@ class StateLayer(CacheLayerMixin):
 
 
 def window_mask(start, n, q, max_len):
-    """Строка j (позиция start+j) видит ключи [0, start+j]; строки паддинга — ключ 0."""
+    """Row j (position start+j) sees keys [0, start+j]; padding rows see key 0."""
     m = np.full((1, 1, q, max_len), MASK_NEG, np.float16)
     for j in range(q):
         m[0, 0, j, :(start + j + 1 if j < n else 1)] = 0
@@ -85,9 +85,9 @@ def window_mask(start, n, q, max_len):
 
 
 def fresh_rope(lm):
-    """Пересоздать модуль RoPE из конфига во fp32. Если модель загружена или хоть раз
-    переведена в bf16/fp16, её inv_freq округлён — ключи в кеше от ANE-prefill
-    слегка расходились бы с RoPE, который mlx-lm считает при генерации точно."""
+    """Recreate the RoPE module from the config in fp32. If the model was loaded in, or ever
+    cast to, bf16/fp16, its inv_freq is rounded, and the cached keys from the ANE prefill
+    would slightly diverge from the RoPE that mlx-lm computes exactly during generation."""
     rope = getattr(getattr(lm, "model", None), "rotary_emb", None)
     if rope is not None:
         try:

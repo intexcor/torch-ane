@@ -1,22 +1,22 @@
-"""Исполнение torch-моделей на Neural Engine через Core AI (macOS 27+, пакет coreai-torch).
+"""Running torch models on the Neural Engine via Core AI (macOS 27+, coreai-torch package).
 
     import torch_ane
     m = torch_ane.compile(model.eval(), example_inputs=(x,))   # device="ane" | "gpu"
-    y = m(x)          # torch.Tensor; первый вызов на форму — компиляция (до ~15 с), дальше кеш
+    y = m(x)          # torch.Tensor; first call per shape compiles (up to ~15 s), then cache
 
-Как это устроено:
-  * torch.export -> get_decomp_table() -> TorchConverter -> .aimodel в fp16:
-    на Маке fp32-модели Core AI исполняет на GPU, на ANE попадает только fp16;
-  * ANE работает только со статическими формами — на каждую форму входа своя
-    модель (по образцу RF-DETR: «один .aimodel на размер батча»), не больше
-    MAX_SHAPES, скомпилированные модели кешируются на диске (CACHE_DIR);
-  * первый вызов на форму сверяется с eager torch (fp32): у fp16 на ANE есть
-    известные тихие порчи (coreai-torch #115, topk/gather) — при расхождении
-    модель для этой формы переезжает на GPU Core AI, а при повторе — на eager.
+How it works:
+  * torch.export -> get_decomp_table() -> TorchConverter -> .aimodel in fp16:
+    on a Mac Core AI runs fp32 models on the GPU, only fp16 reaches the ANE;
+  * the ANE works only with static shapes — each input shape gets its own
+    model (following RF-DETR: "one .aimodel per batch size"), at most
+    MAX_SHAPES, compiled models are cached on disk (CACHE_DIR);
+  * the first call per shape is checked against eager torch (fp32): fp16 on the ANE has
+    known silent corruptions (coreai-torch #115, topk/gather) — on mismatch
+    the model for that shape moves to the Core AI GPU, and on a repeat — to eager.
 
-Замер на M4 (инференс, fp16 ANE / backend MLX fp32 / MPS): ResNet-18 б16 4.5 / 24.5 / 32.7 мс,
-BERT-base 8x128 20 / 71 / 75, ViT-base б8 40 / 109 / 114; энкодеру Whisper ANE не
-помогает (14 против 17), его выгоднее держать на GPU.
+Measured on M4 (inference, fp16 ANE / MLX backend fp32 / MPS): ResNet-18 b16 4.5 / 24.5 / 32.7 ms,
+BERT-base 8x128 20 / 71 / 75, ViT-base b8 40 / 109 / 114; the ANE doesn't help the Whisper
+encoder (14 vs 17), it's better kept on the GPU.
 """
 import asyncio
 import contextlib
@@ -31,25 +31,25 @@ import warnings
 import numpy as np
 import torch
 
-# кеш собранных программ; TORCH_ANE_CACHE — другое место
+# cache of built programs; TORCH_ANE_CACHE — a different location
 CACHE_DIR = pathlib.Path(os.environ.get("TORCH_ANE_CACHE", pathlib.Path.home() / ".cache" / "torch_ane"))
 MAX_SHAPES = 8
-REL_TOL = 5e-2  # fp16 на ANE даёт ~1e-3..1e-2; больше — значит порча
+REL_TOL = 5e-2  # fp16 on ANE gives ~1e-3..1e-2; more means corruption
 
 
 DEVICES = {"ane": "neural_engine", "neural_engine": "neural_engine", "gpu": "gpu"}
 
 
 def _device(name):
-    """"ane" / "gpu" (и имя Core AI "neural_engine") -> имя блока Core AI."""
+    """"ane" / "gpu" (and the Core AI name "neural_engine") -> Core AI compute device name."""
     try:
         return DEVICES[name]
     except KeyError:
-        raise ValueError(f"device: 'ane' или 'gpu', а не {name!r}") from None
+        raise ValueError(f"device: 'ane' or 'gpu', not {name!r}") from None
 
 
 def available():
-    """Есть ли Core AI (macOS 27+ и пакеты coreai-core/coreai-torch)."""
+    """Whether Core AI is available (macOS 27+ and the coreai-core/coreai-torch packages)."""
     try:
         import coreai.runtime  # noqa: F401
         import coreai_torch  # noqa: F401
@@ -59,10 +59,10 @@ def available():
 
 
 def compress_program(prog, kind):
-    """Сжатие весов AIProgram средствами coreai-opt (post-training, без данных)."""
+    """Compress AIProgram weights with coreai-opt (post-training, data-free)."""
     from coreai_opt.coreai_utils import CompressionGranularity as G
     from coreai_opt.coreai_utils import DType, palettize_weights, quantize_weights
-    if kind.startswith("pal"):  # "pal4" (группа 16), "pal4g32", "pal4ch" (по каналам)
+    if kind.startswith("pal"):  # "pal4" (group 16), "pal4g32", "pal4ch" (per channel)
         bits, _, rest = kind[3:].partition("g")
         if bits.endswith("ch"):
             return palettize_weights(prog, lut_dtype=None, n_bits=int(bits[:-2]), granularity=G.PER_CHANNEL)
@@ -73,24 +73,24 @@ def compress_program(prog, kind):
         return quantize_weights(prog, DType.INT8, granularity=G.PER_CHANNEL)
     if kind == "int4":
         return quantize_weights(prog, DType.INT4, granularity=G.PER_BLOCK, block_size=32)
-    if kind in ("int4ch", "int4ch_a"):  # по каналам — формат, который Apple рекомендует для ANE
+    if kind in ("int4ch", "int4ch_a"):  # per channel — the format Apple recommends for ANE
         from coreai_opt.coreai_utils.common import QScheme
         qs = QScheme.ASYMMETRIC if kind == "int4ch_a" else QScheme.SYMMETRIC
         return quantize_weights(prog, DType.INT4, qscheme=qs, granularity=G.PER_CHANNEL)
-    raise ValueError(f"неизвестное сжатие: {kind}")
+    raise ValueError(f"unknown compression: {kind}")
 
 
 def model_digest(model):
-    """Отпечаток модели для ключа кеша: веса, буферы, код классов и простые атрибуты модулей."""
+    """Model fingerprint for the cache key: weights, buffers, class code and simple module attributes."""
     h = hashlib.sha256()
-    # все буферы, включая непостоянные (inv_freq у RoPE): state_dict их не содержит,
-    # и модель с изменёнными частотами RoPE получила бы чужой скомпилированный кеш
+    # all buffers, including non-persistent ones (RoPE inv_freq): state_dict doesn't contain them,
+    # and a model with changed RoPE frequencies would get someone else's compiled cache
     tensors = dict(model.state_dict())
     tensors.update({f"buffer:{k}": v for k, v in model.named_buffers()})
     for k, v in sorted(tensors.items()):
         h.update(k.encode())
         h.update(v.detach().cpu().contiguous().numpy().tobytes())
-    # код модулей: без него правка forward (или модуль без весов) взяла бы старую модель из кеша
+    # module code: without it an edited forward (or a weightless module) would take the old model from cache
     import inspect
     for cls in sorted({type(m) for m in model.modules()}, key=lambda c: (c.__module__, c.__qualname__)):
         h.update(f"{cls.__module__}.{cls.__qualname__}".encode())
@@ -98,8 +98,8 @@ def model_digest(model):
             h.update(inspect.getsource(cls).encode())
         except (OSError, TypeError):
             pass
-    # простые атрибуты модулей (флаги, режимы, размеры): тот же класс с теми же весами,
-    # но другим режимом — другая модель
+    # simple module attributes (flags, modes, sizes): the same class with the same weights
+    # but a different mode is a different model
     for name, mod in model.named_modules():
         attrs = {k: v for k, v in vars(mod).items()
                  if not k.startswith("_") and isinstance(v, (bool, int, float, str, tuple, type(None)))}
@@ -108,10 +108,10 @@ def model_digest(model):
 
 
 class _HalfInputs(torch.nn.Module):
-    """Обёртка для ANE: вещественные входы приходят в fp16 (как у моделей Apple) и
-    внутри приводятся к fp32; проход passes._to_fp16 превращает этот каст в пустой.
-    fp32-вход, приведённый к fp16 первым узлом графа, компилятор вливает в операцию
-    ввода — если вход сразу идёт в SDPA, ANE тихо считает мусор."""
+    """ANE wrapper: floating-point inputs arrive in fp16 (as in Apple's models) and
+    are cast to fp32 inside; the passes._to_fp16 pass turns that cast into a no-op.
+    An fp32 input cast to fp16 by the first graph node gets fused by the compiler into the
+    input op — if the input goes straight into SDPA, the ANE silently computes garbage."""
 
     def __init__(self, model):
         super().__init__()
@@ -123,9 +123,9 @@ class _HalfInputs(torch.nn.Module):
 
 
 class _Fp16Interface(torch.nn.Module):
-    """fp16-модель с fp32-выходом (каст внутри графа). Входы подаются в fp16:
-    NDArray копирует вход поэлементно (~1 ГБ/с, coreai-core 1.0.0b3), и fp16-вход
-    с кастом на CPU (0.2 мс) выходит дешевле, чем fp32-вход с кастом на ANE."""
+    """fp16 model with fp32 output (cast inside the graph). Inputs are fed in fp16:
+    NDArray copies the input element by element (~1 GB/s, coreai-core 1.0.0b3), and an fp16 input
+    with the cast on CPU (0.2 ms) comes out cheaper than an fp32 input with the cast on ANE."""
 
     def __init__(self, m16):
         super().__init__()
@@ -158,41 +158,41 @@ class _Compiled:
                 a = a.half() if self.half_inputs else a
             else:
                 a = a.to(torch.int32)
-            inputs[name] = rt.NDArray(a.contiguous())  # копирует поэлементно, см. _Fp16Interface
+            inputs[name] = rt.NDArray(a.contiguous())  # copies element by element, see _Fp16Interface
         out = self.loop.run_until_complete(self.fn(inputs))
         return [torch.from_numpy(np.array(out[n].numpy())) for n in self.fn.desc.output_names]
 
 
 class CompiledModule(torch.nn.Module):
-    """torch-модуль, исполняемый Core AI: на вход/выход — torch.Tensor (выход в dtype
-    исходной модели), на каждую форму входа — своя статическая программа.
+    """torch module executed by Core AI: torch.Tensor in/out (output in the source model's
+    dtype), a separate static program per input shape.
 
-    device — "ane" или "gpu"; validate — сверять первый вызов формы с eager (при
-    расхождении форма уходит на GPU, потом на eager); compress — сжатие весов готовой
-    программы ("int8", "int4", "pal4"...; см. compress_program). "int8" на ANE делается
-    в torch до экспорта и только в Linear/Conv2d (passes.quantize_int8_modules):
-    сжатие готовой программы задевает и Conv1d, а с int8 в ней компилятор ANE падает."""
+    device — "ane" or "gpu"; validate — check the first call per shape against eager (on
+    mismatch the shape goes to GPU, then to eager); compress — weight compression of the built
+    program ("int8", "int4", "pal4"...; see compress_program). "int8" on ANE is done
+    in torch before export and only in Linear/Conv2d (passes.quantize_int8_modules):
+    compressing the built program also hits Conv1d, and with int8 there the ANE compiler crashes."""
 
     def __init__(self, model, device="ane", validate=True, check=None, rules=None, compress=None,
                  externalize_modules=()):
         super().__init__()
         if not available():
-            raise RuntimeError("Core AI недоступен: нужна macOS 27 и пакет coreai-torch")
+            raise RuntimeError("Core AI unavailable: requires macOS 27 and the coreai-torch package")
         self.model = model.eval()
         self.device = _device(device)
         self.validate = validate
-        # check(ref_outs, got_outs, args) -> bool: своя сверка первого вызова; по умолчанию —
-        # относительная ошибка каждого выхода < REL_TOL и всё конечно
+        # check(ref_outs, got_outs, args) -> bool: custom check of the first call; by default —
+        # relative error of each output < REL_TOL and everything finite
         self.check = check
-        self.rules = rules  # правила Apple для ANE (passes.prepare); None — по умолчанию
-        # сжатие весов готовой программы (coreai-opt, без данных): "pal4"/"pal6"/"pal8" —
-        # таблица значений на группу из 16 каналов (то, что ANE разжимает железом),
-        # "int8" — по каналам, "int4" — блоками по 32; None — fp16
+        self.rules = rules  # Apple's rules for ANE (passes.prepare); None — default
+        # weight compression of the built program (coreai-opt, data-free): "pal4"/"pal6"/"pal8" —
+        # a lookup table per group of 16 channels (what the ANE decompresses in hardware),
+        # "int8" — per channel, "int4" — in blocks of 32; None — fp16
         self.compress = compress
-        # доп. составные операции Core AI (passes.use_composite_ops): SDPA/RoPE/GatherMM/GatedDeltaUpdate
+        # extra Core AI composite ops (passes.use_composite_ops): SDPA/RoPE/GatherMM/GatedDeltaUpdate
         self.externalize_modules = tuple(externalize_modules)
         self.digest = model_digest(model)
-        self._compiled = {}  # сигнатура формы -> _Compiled | "eager"
+        self._compiled = {}  # shape signature -> _Compiled | "eager"
         self.ane_stats = {}
 
     def _path(self, sig):
@@ -202,7 +202,7 @@ class CompiledModule(torch.nn.Module):
         compress = "int8t" if self.compress == "int8" and self.device == "neural_engine" else self.compress
         extra = tuple(x for x in (rules, compress, ext) if x)
         h = hashlib.sha256(repr((sig, *extra) if extra else sig).encode()).hexdigest()[:12]
-        # v4: fp16-входы на ANE; PASSES_VERSION — версия проходов export_for_ane (на GPU не влияет)
+        # v4: fp16 inputs on ANE; PASSES_VERSION — export_for_ane passes version (doesn't affect GPU)
         ver = f"v4{PASSES_VERSION}" if self.device == "neural_engine" else "v4"
         return CACHE_DIR / f"{self.digest}_{h}_{self.device}_{ver}.aimodel"
 
@@ -216,8 +216,8 @@ class CompiledModule(torch.nn.Module):
         with warnings.catch_warnings(), torch.no_grad(), contextlib.redirect_stdout(io.StringIO()):
             warnings.simplefilter("ignore")
             if self.device == "neural_engine":
-                # ANE-проходы (passes): RMSNorm -> составная операция, свёртка констант
-                # (маска, RoPE), причинная маска -> is_causal, затем fp16
+                # ANE passes (passes): RMSNorm -> composite op, constant folding
+                # (mask, RoPE), causal mask -> is_causal, then fp16
                 from coreai_torch.composite_ops import RMSNormImpl
 
                 from . import passes
@@ -245,7 +245,7 @@ class CompiledModule(torch.nn.Module):
         return path
 
     def _check(self, compiled, args):
-        """Сверка первого вызова с eager fp32: ловит тихие порчи fp16 на ANE."""
+        """Check the first call against eager fp32: catches silent fp16 corruptions on ANE."""
         with torch.no_grad():
             ref = self.model(*args)
         ref = [ref] if isinstance(ref, torch.Tensor) else list(ref)
@@ -266,29 +266,29 @@ class CompiledModule(torch.nn.Module):
         if c is not None:
             return c
         if len(self._compiled) >= MAX_SHAPES:
-            warnings.warn(f"torch_ane: больше {MAX_SHAPES} форм входа — новые формы идут в eager torch; "
-                          "для ANE нужны статические формы (дополняйте до фиксированных размеров)")
+            warnings.warn(f"torch_ane: more than {MAX_SHAPES} input shapes — new shapes go to eager torch; "
+                          "ANE needs static shapes (pad to fixed sizes)")
             return "eager"
         path = self._build(args, sig)
         for device in dict.fromkeys([self.device, "gpu"]):
-            # граф ANE-проходов принимает входы в исходном типе (каст в fp16 внутри),
-            # граф _Fp16Interface — в fp16; при откате на GPU файл тот же
+            # the ANE-passes graph takes inputs in the original dtype (fp16 cast inside),
+            # the _Fp16Interface graph — in fp16; on GPU fallback the file is the same
             try:
                 c = _Compiled(path, device)
             except RuntimeError:
-                # старая сборка из кеша перестала грузиться (macOS при нехватке места частично
-                # вычищает системный кеш специализаций Core AI) — пересобираем один раз
-                warnings.warn(f"torch_ane: сборка {path.name} не загружается — пересобираю")
+                # an old cached build stopped loading (when low on space macOS partially
+                # purges the Core AI system specialization cache) — rebuild once
+                warnings.warn(f"torch_ane: build {path.name} fails to load — rebuilding")
                 shutil.rmtree(path, ignore_errors=True)
                 path = self._build(args, sig)
                 c = _Compiled(path, device)
             if not self.validate or self._check(c, args):
                 if device != self.device:
-                    warnings.warn(f"torch_ane: на {self.device} результат расходится с eager — форма {sig} "
-                                  f"переведена на {device}")
+                    warnings.warn(f"torch_ane: on {self.device} the result diverges from eager — shape {sig} "
+                                  f"moved to {device}")
                 self._compiled[sig] = c
                 return c
-        warnings.warn(f"torch_ane: Core AI расходится с eager для формы {sig} — eager torch")
+        warnings.warn(f"torch_ane: Core AI diverges from eager for shape {sig} — eager torch")
         self._compiled[sig] = "eager"
         return "eager"
 
@@ -298,14 +298,14 @@ class CompiledModule(torch.nn.Module):
         if c == "eager":
             return self.model(*args)
         outs = c(args)
-        ref_dtype = next(self.model.parameters(), torch.empty(0)).dtype  # модуль без весов — fp32
+        ref_dtype = next(self.model.parameters(), torch.empty(0)).dtype  # weightless module — fp32
         outs = [o.to(ref_dtype) if o.is_floating_point() else o for o in outs]
         return outs[0] if len(outs) == 1 else tuple(outs)
 
 
-def compile(model, example_inputs=None, device="ane", **kw):  # noqa: A001 — как torch.compile
-    """model -> CompiledModule. С example_inputs компиляция и сверка — сразу, а не на первом
-    вызове. Остальные аргументы — как у CompiledModule (validate, compress, rules...)."""
+def compile(model, example_inputs=None, device="ane", **kw):  # noqa: A001 — like torch.compile
+    """model -> CompiledModule. With example_inputs, compilation and checking happen immediately rather than
+    on the first call. Other arguments — as in CompiledModule (validate, compress, rules...)."""
     m = CompiledModule(model, device=device, **kw)
     if example_inputs is not None:
         m(*example_inputs)
@@ -313,11 +313,11 @@ def compile(model, example_inputs=None, device="ane", **kw):  # noqa: A001 — �
 
 
 def cleanup_mpsgraph_tmp(include_self=False):
-    """Core AI/MPSGraph кладёт в $TMPDIR/com.apple.MetalPerformanceShadersGraph по папке
-    mpsgraph-<pid>-<время> на загруженную программу (копия весов, до гигабайта) и не
-    удаляет их — ни при выходе, ни при падении. Devstral кусками оставлял ~10 ГБ за
-    каждый запуск. Удаляем папки завершившихся процессов (и свои — при выходе). С macOS 27.0.1
-    часть таких папок (компиляция ANE-областей) появляется в ...GraphHost — смотрим обе."""
+    """Core AI/MPSGraph puts a mpsgraph-<pid>-<time> folder into $TMPDIR/com.apple.MetalPerformanceShadersGraph
+    per loaded program (a copy of the weights, up to a gigabyte) and never deletes them —
+    neither on exit nor on crash. Chunked Devstral left ~10 GB per run. We delete folders
+    of finished processes (and our own — on exit). Since macOS 27.0.1 some of these folders
+    (ANE region compilation) appear in ...GraphHost — we check both."""
     tmp = pathlib.Path(os.environ.get("TMPDIR", "/tmp"))
     dirs = [d for r in ("com.apple.MetalPerformanceShadersGraph", "com.apple.MetalPerformanceShadersGraphHost")
             if (tmp / r).is_dir() for d in (tmp / r).glob("mpsgraph-*")]
@@ -351,7 +351,7 @@ _install_tmp_cleanup()
 
 
 def touch_cache(path):
-    """Отметить сборку как использованную (время изменения — для prune_cache)."""
+    """Mark a build as used (modification time — for prune_cache)."""
     try:
         os.utime(path)
     except OSError:
@@ -359,10 +359,10 @@ def touch_cache(path):
 
 
 def prune_cache(max_gb=None, keep=()):
-    """Кеш сборок не больше max_gb (по умолчанию TORCH_ANE_CACHE_GB, 40): удаляются давно
-    не использованные (по времени изменения; загрузка его обновляет), кроме путей keep.
-    Каждая сборка — ~1 ГБ на модель среднего размера, и без лимита эксперименты за сутки
-    съедали сотню гигабайт. Возвращает освобождённые байты."""
+    """Keep the build cache at most max_gb (default TORCH_ANE_CACHE_GB, 40): the least recently
+    used builds are deleted (by modification time; loading updates it), except paths in keep.
+    Each build is ~1 GB for a mid-sized model, and without a limit a day of experiments
+    ate a hundred gigabytes. Returns the freed bytes."""
     max_gb = float(os.environ.get("TORCH_ANE_CACHE_GB", 40) if max_gb is None else max_gb)
     if not CACHE_DIR.is_dir():
         return 0
@@ -384,10 +384,10 @@ def prune_cache(max_gb=None, keep=()):
 
 
 def clear_system_cache():
-    """Системный кеш компиляции Core AI (~/Library/Caches/coreai-cache): по скомпилированной
-    копии каждой когда-либо загруженной модели, сам не чистится (за неделю экспериментов —
-    87 ГБ). Удалять можно только целиком: после частичного удаления Core AI перестаёт
-    загружать модели. Первая загрузка каждой модели после очистки — с компиляцией."""
+    """Core AI system compilation cache (~/Library/Caches/coreai-cache): a compiled copy
+    of every model ever loaded, never cleaned up by itself (a week of experiments —
+    87 GB). Can only be deleted entirely: after a partial deletion Core AI stops
+    loading models. The first load of each model after clearing includes compilation."""
     root = pathlib.Path.home() / "Library" / "Caches" / "coreai-cache"
     freed = 0
     for d in root.iterdir() if root.is_dir() else ():
@@ -398,8 +398,8 @@ def clear_system_cache():
 
 
 def probe_tmpdir():
-    """Временная папка для экспериментов, удаляется при выходе из процесса (раньше пробы
-    брали tempfile.mkdtemp() и оставляли по копии модели на гигабайт за запуск)."""
+    """Temporary folder for experiments, deleted on process exit (previously probes
+    used tempfile.mkdtemp() and left a gigabyte-sized model copy per run)."""
     import atexit
     import tempfile
     d = tempfile.mkdtemp(prefix="torch_ane_probe_")

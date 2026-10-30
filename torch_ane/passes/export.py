@@ -1,20 +1,20 @@
-"""Проходы, которые делают произвольную torch-модель пригодной для Neural Engine.
+"""Passes that make an arbitrary torch model suitable for the Neural Engine.
 
-ANE исполняет только fp16 (и int8). Модели из transformers на него не идут:
-  * RMSNorm внутри уходит во float32 (`hidden_states.to(torch.float32)`);
-  * маска внимания строится сравнениями int64/bool, RoPE (cos/sin) — во float32.
-Core AI режет такой граф между ANE/GPU/CPU — медленно и (coreai-torch #115) тихо
-неверно. Поэтому перед конвертацией, без знания о конкретной модели:
+ANE executes only fp16 (and int8). Models from transformers don't run on it as is:
+  * RMSNorm internally goes to float32 (`hidden_states.to(torch.float32)`);
+  * the attention mask is built from int64/bool comparisons, RoPE (cos/sin) in float32.
+Core AI splits such a graph between ANE/GPU/CPU — slow and (coreai-torch #115) silently
+wrong. So before conversion, without knowledge of the specific model:
 
-  1. swap_rmsnorm: модули, которые ВЕДУТ СЕБЯ как RMSNorm (проверка численная,
-     не по имени), заменяются на RMSNormImpl — составную операцию Core AI:
-     компилятор подставляет родное ядро, fp32-ветки в графе нет;
-  2. fold_constants: всё, что не зависит ни от входа, ни от весов (маска, таблицы
-     RoPE), считается заранее во fp32 и кладётся в граф константами (как freezing
-     в Inductor и constant folding в XLA) — при статической форме это всё;
-  3. causal_mask: свёрнутая маска SDPA, численно равная причинной, заменяется
-     флагом is_causal=True;
-  4. только потом модель и константы переводятся в fp16 — точность RoPE не теряется.
+  1. swap_rmsnorm: modules that BEHAVE like RMSNorm (checked numerically,
+     not by name) are replaced with RMSNormImpl — a Core AI composite op:
+     the compiler substitutes the native kernel, there's no fp32 branch in the graph;
+  2. fold_constants: everything that depends on neither the input nor the weights (mask, RoPE
+     tables) is precomputed in fp32 and put into the graph as constants (like freezing
+     in Inductor and constant folding in XLA) — with a static shape that's all of it;
+  3. causal_mask: a folded SDPA mask numerically equal to the causal one is replaced
+     with the flag is_causal=True;
+  4. only then are the model and constants converted to fp16 — RoPE precision isn't lost.
 """
 import copy
 
@@ -24,24 +24,23 @@ from .layout import chunk_mlp, swap_linear, use_ane_attention
 
 
 aten = torch.ops.aten
-# Правила Apple (ниже) по умолчанию выключены — замеры на M4, macOS 27.0.1, Qwen2.5-0.5B
-# компилятор Core AI сам
-# кладёт SDPA и Linear на ANE; свёртка 1x1 — вровень (+0..7%), внимание по головам —
-# в 1.1-2.6 раза медленнее слитого SDPA даже в чистой раскладке BC1S, а от 12 слоёв
-# ANE ещё и тихо обнуляет выходы после последнего слоя.
-# Включено одно правило — "mlp_chunk" (MLP кусками под внутреннюю память ANE, passes.chunk_mlp):
-# энкодер Whisper large-v3-turbo 368 -> 280 мс, проход Qwen2.5-0.5B на 256 токенах
-# 30.5 -> 26.3 мс, на 8 токенах вровень.
+# Apple's rules (below) are off by default. Measured on M4, macOS 27.0.1, Qwen2.5-0.5B: the
+# Core AI compiler puts SDPA and Linear on ANE by itself; 1x1 conv is on par (+0..7%); per-head
+# attention is 1.1-2.6x slower than fused SDPA even in a clean BC1S layout, and from 12 layers on
+# ANE also silently zeroes the outputs after the last layer.
+# One rule is on — "mlp_chunk" (MLP in chunks to fit ANE on-chip memory, passes.chunk_mlp):
+# Whisper large-v3-turbo encoder 368 -> 280 ms, a Qwen2.5-0.5B pass on 256 tokens
+# 30.5 -> 26.3 ms, on 8 tokens on par.
 DEFAULT_RULES = ("mlp_chunk",)
 
 
-# --- 1. RMSNorm -> составная операция Core AI -----------------------------------
+# --- 1. RMSNorm -> Core AI composite op -----------------------------------------
 
 class ANERMSNorm(torch.nn.Module):
     def __init__(self, weight, eps):
         super().__init__()
         from coreai_torch.composite_ops import RMSNormImpl
-        self.weight = weight  # тот же Parameter, не копия
+        self.weight = weight  # the same Parameter, not a copy
         self.impl = RMSNormImpl(eps=float(eps))
 
     def forward(self, x):
@@ -69,7 +68,7 @@ def _looks_like_rmsnorm(mod):
 
 
 def swap_rmsnorm(model):
-    """Заменяет на месте; возвращает число замен."""
+    """Replaces in place; returns the number of replacements."""
     count = 0
     for name, mod in list(model.named_modules()):
         if isinstance(mod, ANERMSNorm):
@@ -86,19 +85,19 @@ def swap_rmsnorm(model):
     return count
 
 
-# --- 2–3. свёртка констант и причинная маска (на развёрнутом графе) ------------
+# --- 2–3. constant folding and causal mask (on the unrolled graph) -------------
 
 def fold_constants(gm, param_names):
-    """Узлы, не зависящие ни от placeholder'ов, ни от параметров, вычисляются и
-    заменяются константами (буферами gm). Возвращает число свёрнутых границ."""
+    """Nodes that depend on neither placeholders nor parameters are computed and
+    replaced with constants (gm buffers). Returns the number of folded frontier nodes."""
     g = gm.graph
     live = set()
     for n in g.nodes:
         if n.op == "placeholder" or (n.op == "get_attr" and n.target in param_names):
             live.add(n)
         elif n.op == "call_function" and str(n.target).startswith("coreai."):
-            # разжатие весов (coreai.lut_to_dense и т.п.) — не сворачивать: иначе сжатые
-            # веса молча превратятся обратно в плотные константы
+            # weight decompression (coreai.lut_to_dense etc.) — don't fold: otherwise compressed
+            # weights silently turn back into dense constants
             live.add(n)
         elif n.op == "call_function" and (any(a in live for a in n.all_input_nodes)
                                           or n.target is aten._assert_tensor_metadata.default
@@ -108,7 +107,7 @@ def fold_constants(gm, param_names):
         elif n.op == "output":
             live.add(n)
     foldable = [n for n in g.nodes if n.op in ("call_function", "get_attr") and n not in live]
-    # граница: свёртываемый узел, результат которого нужен «живой» части графа
+    # frontier: a foldable node whose result is needed by the "live" part of the graph
     frontier = [n for n in foldable if n.op == "call_function" and any(u in live for u in n.users)]
     if not frontier:
         return 0
@@ -143,7 +142,7 @@ def fold_constants(gm, param_names):
 
 
 def causal_mask_to_flag(gm):
-    """attn_mask SDPA — константа, совпадающая с причинной, -> is_causal=True."""
+    """SDPA attn_mask — a constant matching the causal one -> is_causal=True."""
     g = gm.graph
     count = 0
     for n in g.nodes:
@@ -158,7 +157,7 @@ def causal_mask_to_flag(gm):
         causal = torch.ones(L, S, dtype=torch.bool).tril(S - L)
         if m.dtype == torch.bool:
             ok = bool((m == causal).all())
-        else:  # аддитивная маска 0 / -inf
+        else:  # additive 0 / -inf mask
             ok = bool(((m == 0) == causal).all()) and bool((m[..., ~causal] < -1e4).all())
         if not ok:
             continue
@@ -174,20 +173,20 @@ def causal_mask_to_flag(gm):
 
 
 def _to_fp16(gm, example_args=()):
-    """Параметры, буферы и свёрнутые константы — в fp16; явные касты во fp32
-    внутри графа (кроме касты прямо в выход) — тоже в fp16."""
-    # служебные проверки export вида «этот тензор fp32» после перевода в fp16 ложны
+    """Parameters, buffers and folded constants -> fp16; explicit casts to fp32
+    inside the graph (except a cast straight into the output) -> fp16 too."""
+    # export's internal checks like "this tensor is fp32" are false after conversion to fp16
     for n in list(gm.graph.nodes):
         if n.op == "call_function" and n.target is aten._assert_tensor_metadata.default:
             gm.graph.erase_node(n)
     for name, t in list(gm.named_buffers()) + list(gm.named_parameters()):
         if t.is_floating_point():
             t.data = t.data.half()
-    # вход графа остаётся в исходном типе (конвертер после вынесения модулей сам
-    # переэкспортирует граф с исходными входами), каст в fp16 — первым узлом:
-    # каст F32 <-> F16 на входе/выходе ANE поддерживает
-    # у плейсхолдеров развёрнутого графа нет meta["val"] — типы берём из примерных
-    # входов (плейсхолдеры идут в том же порядке, что и аргументы)
+    # the graph input stays in its original type (after extracting modules the converter itself
+    # re-exports the graph with the original inputs), the cast to fp16 is the first node:
+    # ANE supports an F32 <-> F16 cast at input/output
+    # placeholders of the unrolled graph have no meta["val"] — types are taken from the example
+    # inputs (placeholders come in the same order as the arguments)
     for ph, v in zip([n for n in gm.graph.nodes if n.op == "placeholder"], example_args):
         if isinstance(v, torch.Tensor) and v.dtype == torch.float32:
             with gm.graph.inserting_after(ph):
@@ -195,8 +194,8 @@ def _to_fp16(gm, example_args=()):
             ph.replace_all_uses_with(cast)
             cast.args = (ph,)
     out_args = set(next(n for n in gm.graph.nodes if n.op == "output").all_input_nodes)
-    # неявный float32 из целых входов (деление позиций и т.п. — масштаб внимания Llama 4
-    # у Ministral3): явного dtype у узла нет, поэтому после него вставляется каст в fp16
+    # implicit float32 from integer inputs (division of positions etc. — Llama 4 attention scale
+    # in Ministral3): the node has no explicit dtype, so a cast to fp16 is inserted after it
     for n in list(gm.graph.nodes):
         val = n.meta.get("val") if n.op == "call_function" else None
         ins = [a.meta.get("val") for a in n.all_input_nodes] if val is not None else []
@@ -216,17 +215,17 @@ def _to_fp16(gm, example_args=()):
     return gm
 
 
-# --- сборка --------------------------------------------------------------------
+# --- build ---------------------------------------------------------------------
 
-# версия проходов export_for_ane — входит в ключи кешей сборок (меняется — сборки пересобираются)
-PASSES_VERSION = "s1"  # s1: SiLU через tanh
+# version of the export_for_ane passes — part of the build cache keys (when it changes, builds are rebuilt)
+PASSES_VERSION = "s1"  # s1: SiLU via tanh
 
 
 def silu_to_tanh(gm):
-    """SiLU -> x·0.5·(1 + tanh(x/2)). Родная SiLU на ANE врёт около нуля: на выходе
-    GroupNorm (|x| < 2) ~5% относительной ошибки, UNet tiny-sd из-за этого расходился с
-    eager на 2.5e-2 за вызов. Запись x·sigmoid(x) компилятор узнаёт и подставляет ту же
-    SiLU; через tanh — не узнаёт и считает точно (7.8e-4). Возвращает число замен."""
+    """SiLU -> x·0.5·(1 + tanh(x/2)). Native SiLU on ANE is wrong near zero: at the
+    GroupNorm output (|x| < 2) ~5% relative error, because of this the tiny-sd UNet diverged from
+    eager by 2.5e-2 per call. The compiler recognizes the form x·sigmoid(x) and substitutes the same
+    SiLU; via tanh it doesn't and computes exactly (7.8e-4). Returns the number of replacements."""
     aten = torch.ops.aten
     sig = {aten.sigmoid.default}
     n = 0
@@ -256,20 +255,20 @@ def silu_to_tanh(gm):
 
 
 def export_for_ane(model, args, stats=None):
-    """export_fn для TorchConverter.add_pytorch_module: fp32-экспорт -> свёртка
-    констант -> причинная маска -> fp16 -> повторный экспорт с декомпозициями."""
+    """export_fn for TorchConverter.add_pytorch_module: fp32 export -> constant
+    folding -> causal mask -> fp16 -> re-export with decompositions."""
     from coreai_torch import get_decomp_table
 
     def export_fn(m):
-        # входы — fp16 (их подаёт _HalfInputs из runtime.py, внутри они приводятся к fp32,
-        # после _to_fp16 этот каст исчезает): fp32-вход с кастом прямо в операцию ANE
-        # считает неверно («ANE I/O op can only do F16 MemRef <-> F32 Tensor cast»)
+        # inputs are fp16 (fed by _HalfInputs from runtime.py, inside they're cast to fp32,
+        # after _to_fp16 this cast disappears): ANE computes an fp32 input with a cast straight into an op
+        # incorrectly ("ANE I/O op can only do F16 MemRef <-> F32 Tensor cast")
         ep = torch.export.export(m, args).run_decompositions(get_decomp_table())
-        # копия: ep.module() делит параметры с моделью, а _to_fp16 меняет их на месте —
-        # конвертер потом ещё раз экспортирует исходную модель с fp32-входами
+        # a copy: ep.module() shares parameters with the model, and _to_fp16 changes them in place —
+        # the converter later exports the original model with fp32 inputs once more
         gm = copy.deepcopy(ep.module())
         params = {n for n, _ in gm.named_parameters()}
-        # изменяемые буферы (KV-кеш как состояние модели) — не константы
+        # mutable buffers (KV cache as model state) are not constants
         params |= set(ep.graph_signature.buffers_to_mutate.values())
         folded = fold_constants(gm, params)
         causal = causal_mask_to_flag(gm)
@@ -283,9 +282,10 @@ def export_for_ane(model, args, stats=None):
 
 
 def prepare(model, rules=None):
-    """Копия модели под ANE. rules — набор правил Apple: "conv" (Linear -> свёртка 1x1,
-    раскладка bc1s), "conv_n111" (то же, токены по батчу), "heads" (внимание по
-    головам), "mlp_chunk" (MLP кусками скрытого измерения под внутреннюю память ANE). Возвращает (модель, статистика)."""
+    """A copy of the model for ANE. rules — a set of Apple's rules: "conv" (Linear -> 1x1 conv,
+    bc1s layout), "conv_n111" (the same, tokens along the batch), "heads" (per-head
+    attention), "mlp_chunk" (MLP in chunks of the hidden dimension to fit ANE on-chip memory).
+    Returns (model, stats)."""
     m = copy.deepcopy(model).eval()
     stats = {"rms_norm": swap_rmsnorm(m)}
     rules = set(DEFAULT_RULES if rules is None else rules)

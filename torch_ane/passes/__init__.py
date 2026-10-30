@@ -1,11 +1,11 @@
-"""Проходы над torch-моделями под Neural Engine — нижний уровень torch_ane.
+"""Passes over torch models for the Neural Engine — the low level of torch_ane.
 
-  export     — экспорт для Core AI: RMSNorm -> составная операция, свёртка констант,
-               причинная маска -> is_causal, SiLU через tanh, перевод в fp16;
-  layout     — правила Apple: Linear -> свёртка 1x1 (BC1S), внимание по головам,
-               деление слишком широких проекций, MLP кусками под внутреннюю память ANE;
-  quant      — палитры (lut) и int8 по рецепту Apple, масштаб против субнормальных fp16;
-  composite  — составные SDPA/RoPE/GatherMM/GatedDeltaUpdate Core AI.
+  export     — export for Core AI: RMSNorm -> composite op, constant folding,
+               causal mask -> is_causal, SiLU via tanh, conversion to fp16;
+  layout     — Apple's rules: Linear -> 1x1 conv (BC1S), per-head attention,
+               splitting overly wide projections, MLP in chunks to fit ANE on-chip memory;
+  quant      — palettes (lut) and int8 per Apple's recipe, scale against subnormal fp16;
+  composite  — Core AI composite SDPA/RoPE/GatherMM/GatedDeltaUpdate.
 """
 from .composite import CompositeGatedDelta, CompositeSwitchMLP, use_composite_ops
 from .export import (DEFAULT_RULES, PASSES_VERSION, ANERMSNorm, _to_fp16, causal_mask_to_flag, export_for_ane,

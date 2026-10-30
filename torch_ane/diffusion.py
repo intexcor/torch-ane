@@ -1,10 +1,10 @@
-"""Stable Diffusion (diffusers) на Neural Engine: UNet, текстовый энкодер и VAE-декодер
-через CompiledModule, расписание шагов и токенизатор — на CPU.
+"""Stable Diffusion (diffusers) on the Neural Engine: UNet, text encoder and VAE decoder
+via CompiledModule, step scheduler and tokenizer — on CPU.
 
-Главное для скорости — внимание в раскладке ANE (AttnProcessor): на ANE permute/reshape
-больших тензоров — это копирование памяти, и внимание на 64x64 (4096 токенов) в обычной
-записи было в 9 раз медленнее GPU. По рецепту Apple (BC1S, по головам, einsum без
-транспонирований, softmax по ключам, куски запросов) UNet tiny-sd на ANE быстрее GPU.
+The key to speed is attention in the ANE layout (AttnProcessor): on ANE, permute/reshape
+of large tensors is a memory copy, and attention at 64x64 (4096 tokens) in the usual
+formulation was 9x slower than GPU. Following Apple's recipe (BC1S, per head, einsum without
+transposes, softmax over keys, query chunks) tiny-sd's UNet on ANE is faster than GPU.
 
     sd = StableDiffusion("segmind/tiny-sd")
     image, t = sd("a cute robot sitting on a desk", steps=20, seed=0)
@@ -16,13 +16,13 @@ import time
 import torch
 import torch.nn as nn
 
-Q_CHUNK = 512  # куски запросов во внимании при T > 1024
+Q_CHUNK = 512  # query chunks in attention when T > 1024
 
 
 class AttnProcessor:
-    """Обработчик внимания diffusers в раскладке ANE (как SPLIT_EINSUM у Apple):
-    Q и V — [B, C, 1, T], K — [B, T, 1, C] без транспонирования; по головам einsum
-    bchq,bkhc->bkhq, softmax по оси ключей, длинные запросы — кусками."""
+    """diffusers attention processor in the ANE layout (like Apple's SPLIT_EINSUM):
+    Q and V — [B, C, 1, T], K — [B, T, 1, C] without transposing; per-head einsum
+    bchq,bkhc->bkhq, softmax over the key axis, long queries — in chunks."""
 
     def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None, temb=None, **kw):
         res = hidden_states
@@ -59,7 +59,7 @@ class AttnProcessor:
         return o / attn.rescale_output_factor
 
 
-# версия обработчика — в простом атрибуте обёрток, чтобы кеш сборки CompiledModule менялся вместе с ним
+# processor version — in a plain attribute of the wrappers, so the CompiledModule build cache changes with it
 _ATTN_TAG = hashlib.sha256(inspect.getsource(AttnProcessor).encode()).hexdigest()[:8]
 
 
@@ -74,7 +74,7 @@ class _UNet(nn.Module):
 
 
 class _TextEncoder(nn.Module):
-    """Энкодер CLIP без таблицы эмбеддингов: вход — эмбеддинги токенов+позиций (с CPU)."""
+    """CLIP encoder without the embedding table: input — token+position embeddings (from CPU)."""
 
     def __init__(self, te):
         super().__init__()
@@ -98,9 +98,9 @@ class _VAEDecoder(nn.Module):
 
 
 class StableDiffusion:
-    """Пайплайн Stable Diffusion из diffusers с UNet, текстовым энкодером и VAE-декодером
-    на заданном блоке Core AI ("ane" или "gpu"). Первая сборка программ —
-    минуты, дальше — из кеша."""
+    """diffusers Stable Diffusion pipeline with the UNet, text encoder and VAE decoder
+    on the given Core AI compute device ("ane" or "gpu"). The first program build takes
+    minutes, after that — from cache."""
 
     def __init__(self, model_id="segmind/tiny-sd", device="ane", size=512):
         from diffusers import DPMSolverMultistepScheduler, StableDiffusionPipeline
@@ -114,7 +114,7 @@ class StableDiffusion:
         pipe.unet.eval().set_attn_processor(AttnProcessor())
         pipe.vae.eval().set_attn_processor(AttnProcessor())
         te = pipe.text_encoder.eval()
-        self.t = {}  # время по частям последней генерации
+        self.t = {}  # per-part timings of the last generation
         self._unet = CompiledModule(_UNet(pipe.unet).eval(), device=device, validate=False)
         self._text = CompiledModule(_TextEncoder(te).eval(), device=device, validate=False)
         self._vae = CompiledModule(_VAEDecoder(pipe.vae).eval(), device=device, validate=False)
@@ -138,7 +138,7 @@ class StableDiffusion:
 
             def __call__(self, input_ids, attention_mask=None, output_hidden_states=False, **kw):
                 a = time.perf_counter()
-                with torch.no_grad():  # поиск по таблице эмбеддингов — на CPU
+                with torch.no_grad():  # embedding table lookup — on CPU
                     hidden = te.embeddings(input_ids=input_ids)
                 out = sd._text(hidden.float())
                 sd.t["text"] = sd.t.get("text", 0) + time.perf_counter() - a
@@ -156,7 +156,7 @@ class StableDiffusion:
         self.pipe = pipe
 
     def __call__(self, prompt, steps=20, seed=None, negative_prompt="", guidance=7.5):
-        """-> (PIL-картинка, {"text": с, "unet": [с на шаг], "vae": с, "total": с})."""
+        """-> (PIL image, {"text": s, "unet": [s per step], "vae": s, "total": s})."""
         self.t = {}
         g = torch.Generator("cpu").manual_seed(seed if seed is not None else int(time.time()))
         a = time.perf_counter()
